@@ -1,0 +1,1359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Weekboard</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    #root { width: 100%; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+
+
+// ---------- Config ----------
+const COLORS = [
+  "#E63946", // red
+  "#F4A261", // orange
+  "#E9C46A", // yellow
+  "#2A9D8F", // teal
+  "#264653", // dark blue
+  "#8E7DBE", // purple
+  "#F28BA8", // pink
+  "#6B7280", // gray
+];
+
+const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const START_HOUR = 6;
+const END_HOUR = 23; // last slot ends at 23:00
+const SLOTS_PER_HOUR = 4; // 15-min granularity
+const TOTAL_SLOTS = (END_HOUR - START_HOUR) * SLOTS_PER_HOUR;
+const SLOT_HEIGHT = 14; // px per 15-min slot
+const DAY_COL_WIDTH = 120; // px per day column
+const TIME_COL_WIDTH = 56;
+
+const formatSlot = (slot) => {
+  const totalMin = slot * 15 + START_HOUR * 60;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+};
+
+const formatDuration = (slots) => {
+  const totalMin = slots * 15;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h === 0) return `${m}m`;
+  if (m === 0) return `${h}h`;
+  return `${h}h${m}m`;
+};
+
+// ---------- Persistence ----------
+const STORAGE_KEY = "weekboard:v1";
+
+const loadState = () => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== "object") return null;
+    return {
+      backlog: Array.isArray(data.backlog) ? data.backlog : null,
+      placed: Array.isArray(data.placed) ? data.placed : null,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const DEFAULT_BACKLOG = [
+  { id: "b1", title: "Deep Work", color: COLORS[3], slots: 8 },
+  { id: "b2", title: "Workout", color: COLORS[0], slots: 4 },
+  { id: "b3", title: "Reading", color: COLORS[5], slots: 6 },
+];
+
+// ---------- ICS export ----------
+// Anchor to the Monday of the current ISO week (local time)
+const getMondayOfThisWeek = () => {
+  const now = new Date();
+  const day = now.getDay(); // 0 = Sun, 1 = Mon, ...
+  const diff = day === 0 ? -6 : 1 - day;
+  const monday = new Date(now);
+  monday.setDate(now.getDate() + diff);
+  monday.setHours(0, 0, 0, 0);
+  return monday;
+};
+
+const pad = (n) => String(n).padStart(2, "0");
+
+// ICS expects local datetimes as YYYYMMDDTHHMMSS (without Z)
+const formatIcsLocal = (date) =>
+  `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}T${pad(
+    date.getHours()
+  )}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+
+const formatIcsUtc = (date) =>
+  `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(
+    date.getUTCDate()
+  )}T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(
+    date.getUTCSeconds()
+  )}Z`;
+
+// ICS line escaping per RFC 5545
+const escapeIcsText = (s) =>
+  String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/\n/g, "\\n")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;");
+
+const buildIcs = (placedBlocks) => {
+  const monday = getMondayOfThisWeek();
+  const dtstamp = formatIcsUtc(new Date());
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//weekboard//EN",
+    "CALSCALE:GREGORIAN",
+  ];
+  placedBlocks.forEach((b, i) => {
+    const start = new Date(monday);
+    start.setDate(monday.getDate() + b.day);
+    // startSlot is 15-min offsets from START_HOUR (6:00)
+    const totalStartMin = START_HOUR * 60 + b.startSlot * 15;
+    start.setHours(
+      Math.floor(totalStartMin / 60),
+      totalStartMin % 60,
+      0,
+      0
+    );
+    const end = new Date(start.getTime() + b.slots * 15 * 60 * 1000);
+    const uid = `${b.id}-${monday.getTime()}-${i}@weekboard.local`;
+    lines.push(
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      `DTSTAMP:${dtstamp}`,
+      `DTSTART:${formatIcsLocal(start)}`,
+      `DTEND:${formatIcsLocal(end)}`,
+      `SUMMARY:${escapeIcsText(b.title)}`,
+      "END:VEVENT"
+    );
+  });
+  lines.push("END:VCALENDAR");
+  // RFC 5545 mandates CRLF line endings
+  return lines.join("\r\n");
+};
+
+const downloadIcs = (placedBlocks) => {
+  const ics = buildIcs(placedBlocks);
+  const blob = new Blob([ics], { type: "text/calendar;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const monday = getMondayOfThisWeek();
+  const stamp = `${monday.getFullYear()}${pad(monday.getMonth() + 1)}${pad(
+    monday.getDate()
+  )}`;
+  a.href = url;
+  a.download = `weekboard-${stamp}.ics`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+// ---------- Component ----------
+function WeeklyPlanner() {
+  // Lazy-init from localStorage so first paint already has persisted state
+  const [backlog, setBacklog] = useState(() => {
+    const saved = loadState();
+    return saved?.backlog ?? DEFAULT_BACKLOG;
+  });
+
+  const [placed, setPlaced] = useState(() => {
+    const saved = loadState();
+    return saved?.placed ?? [];
+  });
+
+  // Persist whenever backlog or placed changes
+  React.useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ backlog, placed })
+      );
+    } catch {
+      // storage unavailable (quota / private mode) – fail silently
+    }
+  }, [backlog, placed]);
+
+  // form for new block
+  const [newTitle, setNewTitle] = useState("");
+  const [newColor, setNewColor] = useState(COLORS[3]);
+  const [newSlots, setNewSlots] = useState(4); // 1h default
+
+  // two-step confirm state for "Clear everything"
+  const [confirmingClear, setConfirmingClear] = useState(false);
+
+  // drag state
+  const [dragging, setDragging] = useState(null); // { source: 'backlog'|'placed', id, slots, color, title }
+  const [hoverCell, setHoverCell] = useState(null); // { day, startSlot }
+  const [backlogDropIndex, setBacklogDropIndex] = useState(null); // index where dragged backlog item would land
+
+  // resize state for placed blocks
+  const [resizing, setResizing] = useState(null); // { id, startY, originalSlots }
+
+  const gridRef = useRef(null);
+
+  // ---------- Backlog ops ----------
+  const addBlock = () => {
+    const title = newTitle.trim() || "Untitled";
+    setBacklog((prev) => [
+      ...prev,
+      {
+        id: `b${Date.now()}`,
+        title,
+        color: newColor,
+        slots: newSlots,
+      },
+    ]);
+    setNewTitle("");
+  };
+
+  const deleteBacklog = (id) => {
+    setBacklog((prev) => prev.filter((b) => b.id !== id));
+  };
+
+  // Removing a placed block sends it back to the backlog (only backlog deletion is final).
+  const deletePlaced = (id) => {
+    const src = placed.find((b) => b.id === id);
+    if (!src) return;
+    setPlaced((prev) => prev.filter((b) => b.id !== id));
+    setBacklog((prev) => [
+      ...prev,
+      {
+        id: `b${Date.now()}`,
+        title: src.title,
+        color: src.color,
+        slots: src.slots,
+      },
+    ]);
+  };
+
+  // ---------- Duplicate & Split ----------
+  const duplicateBacklog = (id) => {
+    setBacklog((prev) => {
+      const idx = prev.findIndex((b) => b.id === id);
+      if (idx === -1) return prev;
+      const src = prev[idx];
+      const copy = { ...src, id: `b${Date.now()}` };
+      const next = [...prev];
+      next.splice(idx + 1, 0, copy);
+      return next;
+    });
+  };
+
+  const duplicatePlaced = (id) => {
+    // Add a copy to the backlog (rather than guessing a calendar slot)
+    const src = placed.find((b) => b.id === id);
+    if (!src) return;
+    setBacklog((prev) => [
+      ...prev,
+      {
+        id: `b${Date.now()}`,
+        title: src.title,
+        color: src.color,
+        slots: src.slots,
+      },
+    ]);
+  };
+
+  const splitBacklog = (id) => {
+    setBacklog((prev) => {
+      const idx = prev.findIndex((b) => b.id === id);
+      if (idx === -1) return prev;
+      const src = prev[idx];
+      if (src.slots < 2) return prev; // can't split 15 min
+      const firstSlots = Math.floor(src.slots / 2);
+      const secondSlots = src.slots - firstSlots;
+      const ts = Date.now();
+      const next = [...prev];
+      next.splice(
+        idx,
+        1,
+        { ...src, slots: firstSlots, id: `b${ts}a` },
+        { ...src, slots: secondSlots, id: `b${ts}b` }
+      );
+      return next;
+    });
+  };
+
+  const splitPlaced = (id) => {
+    const src = placed.find((b) => b.id === id);
+    if (!src || src.slots < 2) return;
+    const firstSlots = Math.floor(src.slots / 2);
+    const secondSlots = src.slots - firstSlots;
+    const secondStart = src.startSlot + firstSlots;
+    const fitsOnGrid = secondStart + secondSlots <= TOTAL_SLOTS;
+    const ts = Date.now();
+
+    setPlaced((prev) => {
+      const next = prev.map((b) =>
+        b.id === id ? { ...b, slots: firstSlots, id: `p${ts}a` } : b
+      );
+      if (fitsOnGrid) {
+        next.push({
+          ...src,
+          id: `p${ts}b`,
+          slots: secondSlots,
+          startSlot: secondStart,
+        });
+      }
+      return next;
+    });
+
+    // If second half wouldn't fit below, drop it into the backlog
+    if (!fitsOnGrid) {
+      setBacklog((prev) => [
+        ...prev,
+        {
+          id: `b${ts}b`,
+          title: src.title,
+          color: src.color,
+          slots: secondSlots,
+        },
+      ]);
+    }
+  };
+
+  // ---------- Resize ----------
+  const startResize = (e, block) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setResizing({
+      id: block.id,
+      startY: e.clientY,
+      originalSlots: block.slots,
+      startSlot: block.startSlot,
+    });
+  };
+
+  React.useEffect(() => {
+    if (!resizing) return;
+    const onMove = (e) => {
+      const deltaY = e.clientY - resizing.startY;
+      const deltaSlots = Math.round(deltaY / SLOT_HEIGHT);
+      let newSlots = resizing.originalSlots + deltaSlots;
+      if (newSlots < 1) newSlots = 1;
+      // clamp so block doesn't run off grid
+      const maxSlots = TOTAL_SLOTS - resizing.startSlot;
+      if (newSlots > maxSlots) newSlots = maxSlots;
+      setPlaced((prev) =>
+        prev.map((b) =>
+          b.id === resizing.id ? { ...b, slots: newSlots } : b
+        )
+      );
+    };
+    const onUp = () => setResizing(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizing]);
+
+  // ---------- Drag handlers ----------
+  const onDragStartBacklog = (e, block) => {
+    setDragging({
+      source: "backlog",
+      id: block.id,
+      slots: block.slots,
+      color: block.color,
+      title: block.title,
+      grabOffset: computeGrabOffset(e),
+    });
+    e.dataTransfer.effectAllowed = "move";
+    // required to actually initiate a drag in some browsers
+    e.dataTransfer.setData("text/plain", block.id);
+  };
+
+  const onDragStartPlaced = (e, block) => {
+    setDragging({
+      source: "placed",
+      id: block.id,
+      slots: block.slots,
+      color: block.color,
+      title: block.title,
+      grabOffset: computeGrabOffset(e),
+    });
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", block.id);
+  };
+
+  const onDragEnd = () => {
+    setDragging(null);
+    setHoverCell(null);
+    setBacklogDropIndex(null);
+  };
+
+  // How many slots from the top of the block the user grabbed.
+  // Used so the block stays "anchored" under the cursor while dragging.
+  const computeGrabOffset = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const offsetY = e.clientY - rect.top;
+    return Math.floor(offsetY / SLOT_HEIGHT);
+  };
+
+  // Compute the snapped target cell from a mouse event over the grid
+  const computeTargetCell = (e) => {
+    if (!gridRef.current || !dragging) return null;
+    const rect = gridRef.current.getBoundingClientRect();
+    const xRaw = e.clientX - rect.left;
+    const yRaw = e.clientY - rect.top;
+
+    // day column index
+    const dayIndex = Math.floor(xRaw / DAY_COL_WIDTH);
+    if (dayIndex < 0 || dayIndex >= DAYS.length) return null;
+
+    // slot index (snap to nearest 15 min), accounting for where the user grabbed the block
+    const grabOffset = dragging.grabOffset || 0;
+    let startSlot = Math.floor(yRaw / SLOT_HEIGHT) - grabOffset;
+    if (startSlot < 0) startSlot = 0;
+    if (startSlot + dragging.slots > TOTAL_SLOTS) {
+      startSlot = TOTAL_SLOTS - dragging.slots;
+    }
+    if (startSlot < 0) return null; // block too big to fit
+
+    return { day: dayIndex, startSlot };
+  };
+
+  const onGridDragOver = (e) => {
+    if (!dragging) return;
+    e.preventDefault(); // allow drop
+    e.dataTransfer.dropEffect = "move";
+    const cell = computeTargetCell(e);
+    if (cell) {
+      // only update if changed (avoid render churn)
+      if (
+        !hoverCell ||
+        hoverCell.day !== cell.day ||
+        hoverCell.startSlot !== cell.startSlot
+      ) {
+        setHoverCell(cell);
+      }
+      // clear backlog drop indicator when we're over the grid
+      if (backlogDropIndex !== null) setBacklogDropIndex(null);
+    }
+  };
+
+  const onGridDragLeave = (e) => {
+    // only clear if leaving the grid entirely
+    if (!gridRef.current) return;
+    const rect = gridRef.current.getBoundingClientRect();
+    if (
+      e.clientX < rect.left ||
+      e.clientX >= rect.right ||
+      e.clientY < rect.top ||
+      e.clientY >= rect.bottom
+    ) {
+      setHoverCell(null);
+    }
+  };
+
+  const onGridDrop = (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+    const cell = computeTargetCell(e);
+    if (!cell) {
+      onDragEnd();
+      return;
+    }
+
+    if (dragging.source === "backlog") {
+      const block = backlog.find((b) => b.id === dragging.id);
+      if (block) {
+        setBacklog((prev) => prev.filter((b) => b.id !== block.id));
+        setPlaced((prev) => [
+          ...prev,
+          {
+            id: `p${Date.now()}`,
+            title: block.title,
+            color: block.color,
+            slots: block.slots,
+            day: cell.day,
+            startSlot: cell.startSlot,
+          },
+        ]);
+      }
+    } else if (dragging.source === "placed") {
+      setPlaced((prev) =>
+        prev.map((b) =>
+          b.id === dragging.id
+            ? { ...b, day: cell.day, startSlot: cell.startSlot }
+            : b
+        )
+      );
+    }
+
+    onDragEnd();
+  };
+
+  // Allow dropping into backlog: either to unplace from calendar, or to reorder within backlog.
+  // backlogDropIndex represents the insertion index (0..backlog.length).
+  const onBacklogDragOver = (e) => {
+    if (!dragging) return;
+    if (dragging.source === "placed" || dragging.source === "backlog") {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+    }
+  };
+
+  // Called by each backlog item to update the insertion index based on cursor position
+  const onBacklogItemDragOver = (e, index) => {
+    if (!dragging) return;
+    if (dragging.source !== "placed" && dragging.source !== "backlog") return;
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const isAfter = e.clientY > rect.top + rect.height / 2;
+    const newIdx = isAfter ? index + 1 : index;
+    if (backlogDropIndex !== newIdx) setBacklogDropIndex(newIdx);
+    if (hoverCell !== null) setHoverCell(null);
+  };
+
+  // Called by the backlog container's empty area (after the last item)
+  const onBacklogEmptyDragOver = (e) => {
+    if (!dragging) return;
+    if (dragging.source !== "placed" && dragging.source !== "backlog") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (backlogDropIndex !== backlog.length) setBacklogDropIndex(backlog.length);
+  };
+
+  const onBacklogDrop = (e) => {
+    e.preventDefault();
+    if (!dragging) return;
+
+    // default insertion index = end of list
+    let insertAt = backlogDropIndex ?? backlog.length;
+
+    if (dragging.source === "placed") {
+      const block = placed.find((b) => b.id === dragging.id);
+      if (block) {
+        setPlaced((prev) => prev.filter((b) => b.id !== block.id));
+        setBacklog((prev) => {
+          const next = [...prev];
+          next.splice(insertAt, 0, {
+            id: `b${Date.now()}`,
+            title: block.title,
+            color: block.color,
+            slots: block.slots,
+          });
+          return next;
+        });
+      }
+    } else if (dragging.source === "backlog") {
+      // reorder within backlog
+      const fromIdx = backlog.findIndex((b) => b.id === dragging.id);
+      if (fromIdx === -1) {
+        onDragEnd();
+        return;
+      }
+      // Adjust target index because we're removing fromIdx first
+      let toIdx = insertAt;
+      if (toIdx > fromIdx) toIdx -= 1;
+      if (toIdx === fromIdx) {
+        onDragEnd();
+        return;
+      }
+      setBacklog((prev) => {
+        const next = [...prev];
+        const [item] = next.splice(fromIdx, 1);
+        next.splice(toIdx, 0, item);
+        return next;
+      });
+    }
+    onDragEnd();
+  };
+
+  // ---------- Render ----------
+  return (
+    <div
+      style={{
+        fontFamily:
+          "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+        background: "#FAF8F3",
+        minHeight: "100vh",
+        padding: "24px",
+        color: "#1a1a1a",
+      }}
+    >
+      <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-end",
+            marginBottom: 24,
+            gap: 16,
+          }}
+        >
+          <div>
+            <h1
+              style={{
+                fontFamily: "'Fraunces', 'Times New Roman', serif",
+                fontSize: 36,
+                fontWeight: 500,
+                margin: "0 0 4px 0",
+                letterSpacing: "-0.02em",
+              }}
+            >
+              weekboard
+            </h1>
+            <p style={{ margin: 0, fontSize: 12, color: "#666" }}>
+              define blocks · drag onto the week · 15-min snap
+            </p>
+          </div>
+
+          {/* Header actions */}
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button
+              onClick={() => downloadIcs(placed)}
+              disabled={placed.length === 0}
+              title={
+                placed.length === 0
+                  ? "Place some blocks on the week first"
+                  : "Download as .ics (anchored to this Monday)"
+              }
+              style={{
+                padding: "8px 14px",
+                background: placed.length === 0 ? "#F0EDE5" : "#fff",
+                color: placed.length === 0 ? "#aaa" : "#1a1a1a",
+                border: "1px solid #E5E1D8",
+                borderRadius: 3,
+                fontSize: 12,
+                cursor: placed.length === 0 ? "not-allowed" : "pointer",
+                fontFamily: "inherit",
+                letterSpacing: "0.05em",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+              }}
+            >
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 10 10"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M5 1 L5 7" />
+                <path d="M2.5 4.5 L5 7 L7.5 4.5" />
+                <path d="M1.5 8.5 L8.5 8.5" />
+              </svg>
+              export .ics
+            </button>
+
+            {confirmingClear ? (
+              <div
+                style={{
+                  display: "flex",
+                  gap: 6,
+                  alignItems: "center",
+                  background: "#FEF2F2",
+                  border: "1px solid #FECACA",
+                  borderRadius: 3,
+                  padding: "4px 4px 4px 12px",
+                  fontSize: 12,
+                }}
+              >
+                <span style={{ color: "#991B1B" }}>delete everything?</span>
+                <button
+                  onClick={() => {
+                    setBacklog([]);
+                    setPlaced([]);
+                    setConfirmingClear(false);
+                  }}
+                  style={{
+                    padding: "4px 10px",
+                    background: "#DC2626",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: 2,
+                    fontSize: 11,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    letterSpacing: "0.05em",
+                  }}
+                >
+                  yes, clear
+                </button>
+                <button
+                  onClick={() => setConfirmingClear(false)}
+                  style={{
+                    padding: "4px 10px",
+                    background: "transparent",
+                    color: "#666",
+                    border: "1px solid #E5E1D8",
+                    borderRadius: 2,
+                    fontSize: 11,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                  }}
+                >
+                  cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmingClear(true)}
+                disabled={backlog.length === 0 && placed.length === 0}
+                title="Remove all blocks (backlog + week)"
+                style={{
+                  padding: "8px 14px",
+                  background: "transparent",
+                  color:
+                    backlog.length === 0 && placed.length === 0
+                      ? "#bbb"
+                      : "#991B1B",
+                  border: "1px solid #E5E1D8",
+                  borderRadius: 3,
+                  fontSize: 12,
+                  cursor:
+                    backlog.length === 0 && placed.length === 0
+                      ? "not-allowed"
+                      : "pointer",
+                  fontFamily: "inherit",
+                  letterSpacing: "0.05em",
+                }}
+              >
+                clear all
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
+          {/* ---------------- LEFT: Backlog ---------------- */}
+          <div style={{ width: 280, flexShrink: 0 }}>
+            {/* New block form */}
+            <div
+              style={{
+                background: "#fff",
+                border: "1px solid #E5E1D8",
+                borderRadius: 4,
+                padding: 16,
+                marginBottom: 16,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 10,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.1em",
+                  color: "#999",
+                  marginBottom: 12,
+                }}
+              >
+                new block
+              </div>
+
+              <input
+                type="text"
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addBlock()}
+                placeholder="title"
+                style={{
+                  width: "100%",
+                  boxSizing: "border-box",
+                  padding: "8px 10px",
+                  border: "1px solid #E5E1D8",
+                  borderRadius: 3,
+                  fontSize: 13,
+                  fontFamily: "inherit",
+                  marginBottom: 12,
+                  background: "#FAF8F3",
+                  outline: "none",
+                }}
+              />
+
+              {/* color picker */}
+              <div
+                style={{
+                  display: "flex",
+                  gap: 6,
+                  marginBottom: 12,
+                  flexWrap: "wrap",
+                }}
+              >
+                {COLORS.map((c) => (
+                  <button
+                    key={c}
+                    onClick={() => setNewColor(c)}
+                    style={{
+                      width: 24,
+                      height: 24,
+                      borderRadius: "50%",
+                      background: c,
+                      border:
+                        newColor === c
+                          ? "2px solid #1a1a1a"
+                          : "2px solid transparent",
+                      cursor: "pointer",
+                      padding: 0,
+                      transition: "transform 0.1s",
+                      transform: newColor === c ? "scale(1.1)" : "scale(1)",
+                    }}
+                  />
+                ))}
+              </div>
+
+              {/* duration slider */}
+              <div style={{ marginBottom: 12 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    fontSize: 11,
+                    color: "#666",
+                    marginBottom: 4,
+                  }}
+                >
+                  <span>duration</span>
+                  <span style={{ color: "#1a1a1a", fontWeight: 500 }}>
+                    {formatDuration(newSlots)}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={24}
+                  step={1}
+                  value={newSlots}
+                  onChange={(e) => setNewSlots(Number(e.target.value))}
+                  style={{ width: "100%", accentColor: newColor }}
+                />
+              </div>
+
+              <button
+                onClick={addBlock}
+                style={{
+                  width: "100%",
+                  padding: "8px",
+                  background: "#1a1a1a",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 3,
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  letterSpacing: "0.05em",
+                }}
+              >
+                add to backlog
+              </button>
+            </div>
+
+            {/* Backlog list - drop zone */}
+            <div
+              onDragOver={onBacklogDragOver}
+              onDrop={onBacklogDrop}
+              style={{
+                background: "#fff",
+                border: "1px solid #E5E1D8",
+                borderRadius: 4,
+                padding: 12,
+                minHeight: 200,
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 10,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.1em",
+                  color: "#999",
+                  marginBottom: 12,
+                  display: "flex",
+                  justifyContent: "space-between",
+                }}
+              >
+                <span>backlog</span>
+                <span>{backlog.length}</span>
+              </div>
+
+              <div
+                style={{ display: "flex", flexDirection: "column", gap: 4 }}
+                onDragOver={onBacklogEmptyDragOver}
+              >
+                {backlog.map((b, i) => (
+                  <React.Fragment key={b.id}>
+                    {/* drop indicator above this item */}
+                    {dragging &&
+                      (dragging.source === "backlog" ||
+                        dragging.source === "placed") &&
+                      backlogDropIndex === i && (
+                        <div
+                          style={{
+                            height: 2,
+                            background: "#1a1a1a",
+                            borderRadius: 1,
+                            margin: "-2px 0",
+                          }}
+                        />
+                      )}
+                    <div onDragOver={(e) => onBacklogItemDragOver(e, i)}>
+                      <BacklogBlock
+                        block={b}
+                        onDragStart={(e) => onDragStartBacklog(e, b)}
+                        onDragEnd={onDragEnd}
+                        onDelete={() => deleteBacklog(b.id)}
+                        onDuplicate={() => duplicateBacklog(b.id)}
+                        onSplit={() => splitBacklog(b.id)}
+                        isDragging={dragging?.id === b.id}
+                      />
+                    </div>
+                  </React.Fragment>
+                ))}
+                {/* drop indicator at end of list */}
+                {dragging &&
+                  (dragging.source === "backlog" ||
+                    dragging.source === "placed") &&
+                  backlogDropIndex === backlog.length &&
+                  backlog.length > 0 && (
+                    <div
+                      style={{
+                        height: 2,
+                        background: "#1a1a1a",
+                        borderRadius: 1,
+                      }}
+                    />
+                  )}
+                {backlog.length === 0 && (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "#bbb",
+                      textAlign: "center",
+                      padding: "20px 0",
+                      fontStyle: "italic",
+                    }}
+                  >
+                    drop here to unplace
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* ---------------- RIGHT: Week grid ---------------- */}
+          <div
+            style={{
+              background: "#fff",
+              border: "1px solid #E5E1D8",
+              borderRadius: 4,
+              padding: 16,
+              flex: 1,
+              overflow: "auto",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                width: TIME_COL_WIDTH + DAY_COL_WIDTH * DAYS.length,
+              }}
+            >
+              {/* time gutter */}
+              <div style={{ width: TIME_COL_WIDTH, flexShrink: 0 }}>
+                <div style={{ height: 32 }} />
+                {Array.from({ length: END_HOUR - START_HOUR }).map((_, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      height: SLOT_HEIGHT * SLOTS_PER_HOUR,
+                      fontSize: 10,
+                      color: "#999",
+                      paddingRight: 8,
+                      textAlign: "right",
+                      borderTop: "1px solid #F0EDE5",
+                      paddingTop: 2,
+                    }}
+                  >
+                    {String(START_HOUR + i).padStart(2, "0")}:00
+                  </div>
+                ))}
+              </div>
+
+              {/* day columns + drop zone */}
+              <div style={{ position: "relative", flex: 1 }}>
+                {/* headers */}
+                <div style={{ display: "flex", height: 32 }}>
+                  {DAYS.map((d) => (
+                    <div
+                      key={d}
+                      style={{
+                        width: DAY_COL_WIDTH,
+                        fontSize: 11,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.1em",
+                        color: "#666",
+                        textAlign: "center",
+                        paddingTop: 8,
+                        borderLeft: "1px solid #F0EDE5",
+                      }}
+                    >
+                      {d}
+                    </div>
+                  ))}
+                </div>
+
+                {/* grid + drop area */}
+                <div
+                  ref={gridRef}
+                  onDragOver={onGridDragOver}
+                  onDragLeave={onGridDragLeave}
+                  onDrop={onGridDrop}
+                  style={{
+                    position: "relative",
+                    width: DAY_COL_WIDTH * DAYS.length,
+                    height: SLOT_HEIGHT * TOTAL_SLOTS,
+                  }}
+                >
+                  {/* hour grid lines */}
+                  {Array.from({ length: END_HOUR - START_HOUR }).map((_, i) => (
+                    <div
+                      key={`h${i}`}
+                      style={{
+                        position: "absolute",
+                        top: i * SLOT_HEIGHT * SLOTS_PER_HOUR,
+                        left: 0,
+                        right: 0,
+                        height: SLOT_HEIGHT * SLOTS_PER_HOUR,
+                        borderTop: "1px solid #F0EDE5",
+                      }}
+                    />
+                  ))}
+                  {/* day column dividers */}
+                  {DAYS.map((_, i) => (
+                    <div
+                      key={`d${i}`}
+                      style={{
+                        position: "absolute",
+                        left: i * DAY_COL_WIDTH,
+                        top: 0,
+                        bottom: 0,
+                        width: 1,
+                        background: "#F0EDE5",
+                      }}
+                    />
+                  ))}
+
+                  {/* hover preview */}
+                  {dragging && hoverCell && (
+                    <div
+                      style={{
+                        position: "absolute",
+                        left: hoverCell.day * DAY_COL_WIDTH + 2,
+                        top: hoverCell.startSlot * SLOT_HEIGHT,
+                        width: DAY_COL_WIDTH - 4,
+                        height: dragging.slots * SLOT_HEIGHT,
+                        background: dragging.color,
+                        opacity: 0.35,
+                        borderRadius: 3,
+                        border: `2px dashed ${dragging.color}`,
+                        boxSizing: "border-box",
+                        pointerEvents: "none",
+                        zIndex: 5,
+                      }}
+                    />
+                  )}
+
+                  {/* placed blocks */}
+                  {placed.map((b) => (
+                    <PlacedBlock
+                      key={b.id}
+                      block={b}
+                      onDragStart={(e) => onDragStartPlaced(e, b)}
+                      onDragEnd={onDragEnd}
+                      onDelete={() => deletePlaced(b.id)}
+                      onDuplicate={() => duplicatePlaced(b.id)}
+                      onSplit={() => splitPlaced(b.id)}
+                      isDragging={dragging?.id === b.id}
+                      onStartResize={(e) => startResize(e, b)}
+                      isResizing={resizing?.id === b.id}
+                    />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Sub-components ----------
+
+function BacklogBlock({
+  block,
+  onDragStart,
+  onDragEnd,
+  onDelete,
+  onDuplicate,
+  onSplit,
+  isDragging,
+}) {
+  const [hover, setHover] = useState(false);
+  const canSplit = block.slots >= 2;
+  return (
+    <div
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        background: block.color,
+        color: "#fff",
+        height: block.slots * SLOT_HEIGHT,
+        minHeight: 28,
+        borderRadius: 3,
+        padding: "6px 10px",
+        cursor: "grab",
+        opacity: isDragging ? 0.4 : 1,
+        position: "relative",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "space-between",
+        fontSize: 12,
+        userSelect: "none",
+        transition: "opacity 0.15s",
+      }}
+    >
+      <div style={{ fontWeight: 500, paddingRight: 56, lineHeight: 1.3 }}>
+        {block.title}
+      </div>
+      <div style={{ fontSize: 10, opacity: 0.8 }}>
+        {formatDuration(block.slots)}
+      </div>
+      {hover && (
+        <ActionButtons
+          onDuplicate={onDuplicate}
+          onSplit={onSplit}
+          onDelete={onDelete}
+          canSplit={canSplit}
+        />
+      )}
+    </div>
+  );
+}
+
+function PlacedBlock({
+  block,
+  onDragStart,
+  onDragEnd,
+  onDelete,
+  onDuplicate,
+  onSplit,
+  isDragging,
+  onStartResize,
+  isResizing,
+}) {
+  const [hover, setHover] = useState(false);
+  const endSlot = block.startSlot + block.slots;
+  const canSplit = block.slots >= 2;
+  return (
+    <div
+      draggable={!isResizing}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        position: "absolute",
+        left: block.day * DAY_COL_WIDTH + 2,
+        top: block.startSlot * SLOT_HEIGHT,
+        width: DAY_COL_WIDTH - 4,
+        height: block.slots * SLOT_HEIGHT,
+        background: block.color,
+        color: "#fff",
+        borderRadius: 3,
+        padding: "4px 8px",
+        boxSizing: "border-box",
+        cursor: isResizing ? "ns-resize" : "grab",
+        opacity: isDragging ? 0.3 : 1,
+        fontSize: 11,
+        userSelect: "none",
+        zIndex: isResizing ? 10 : 2,
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "space-between",
+        overflow: "hidden",
+        transition: isResizing ? "none" : "opacity 0.15s",
+      }}
+    >
+      <div style={{ fontWeight: 500, paddingRight: 56, lineHeight: 1.25 }}>
+        {block.title}
+      </div>
+      <div
+        style={{
+          fontSize: 9,
+          opacity: 0.85,
+          display: "flex",
+          justifyContent: "space-between",
+          paddingRight: 12,
+        }}
+      >
+        <span>
+          {formatSlot(block.startSlot)}–{formatSlot(endSlot)}
+        </span>
+      </div>
+      {hover && !isResizing && (
+        <ActionButtons
+          onDuplicate={onDuplicate}
+          onSplit={onSplit}
+          onDelete={onDelete}
+          canSplit={canSplit}
+          deleteVariant="unplace"
+        />
+      )}
+      {/* Resize handle */}
+      <div
+        onMouseDown={onStartResize}
+        style={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: 0,
+          height: 6,
+          cursor: "ns-resize",
+          background:
+            hover || isResizing ? "rgba(0,0,0,0.25)" : "transparent",
+          transition: "background 0.15s",
+        }}
+      />
+    </div>
+  );
+}
+
+// ---------- Action buttons (duplicate / split / delete) ----------
+// deleteVariant: 'remove' shows ×, 'unplace' shows a left-arrow indicating "send back to backlog"
+function ActionButtons({ onDuplicate, onSplit, onDelete, canSplit, deleteVariant = "remove" }) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        top: 3,
+        right: 3,
+        display: "flex",
+        gap: 3,
+      }}
+    >
+      <IconButton onClick={onDuplicate} title="Duplicate">
+        {/* two overlapping squares */}
+        <svg
+          width="9"
+          height="9"
+          viewBox="0 0 10 10"
+          fill="none"
+          stroke="#fff"
+          strokeWidth="1.2"
+        >
+          <rect x="1" y="1" width="6" height="6" rx="0.5" />
+          <rect x="3" y="3" width="6" height="6" rx="0.5" fill="currentColor" />
+        </svg>
+      </IconButton>
+      {canSplit && (
+        <IconButton onClick={onSplit} title="Split in two">
+          {/* horizontal split icon */}
+          <svg
+            width="9"
+            height="9"
+            viewBox="0 0 10 10"
+            fill="none"
+            stroke="#fff"
+            strokeWidth="1.2"
+          >
+            <rect x="1" y="1" width="8" height="3.2" rx="0.5" />
+            <rect x="1" y="5.8" width="8" height="3.2" rx="0.5" />
+          </svg>
+        </IconButton>
+      )}
+      <IconButton
+        onClick={onDelete}
+        title={deleteVariant === "unplace" ? "Move to backlog" : "Delete"}
+      >
+        {deleteVariant === "unplace" ? (
+          // left arrow (unplace → backlog)
+          <svg
+            width="9"
+            height="9"
+            viewBox="0 0 10 10"
+            fill="none"
+            stroke="#fff"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M6 2 L2.5 5 L6 8" />
+            <path d="M2.5 5 L8 5" />
+          </svg>
+        ) : (
+          <span style={{ fontSize: 11, lineHeight: 1 }}>×</span>
+        )}
+      </IconButton>
+    </div>
+  );
+}
+
+function IconButton({ onClick, title, children }) {
+  const [h, setH] = useState(false);
+  return (
+    <button
+      title={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onMouseEnter={() => setH(true)}
+      onMouseLeave={() => setH(false)}
+      draggable={false}
+      style={{
+        width: 16,
+        height: 16,
+        border: "none",
+        background: h ? "rgba(0,0,0,0.45)" : "rgba(0,0,0,0.22)",
+        color: "#fff",
+        borderRadius: "50%",
+        cursor: "pointer",
+        padding: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        lineHeight: 1,
+        transition: "background 0.12s",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<WeeklyPlanner />);
+  </script>
+</body>
+</html>
